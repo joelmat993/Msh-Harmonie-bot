@@ -1,86 +1,72 @@
-require("dotenv").config();
-const express = require("express");
+const { NODES } = require("./content");
+const { detectEmergency } = require("./emergencyDetection");
 const {
-  sendTextMessage,
-  sendButtonsMessage,
-  markAsRead,
-} = require("./whatsappClient");
-const { processMessage, buildOutgoingMessage } = require("./conversationEngine");
+  getOrCreateSession,
+  updateSession,
+  logInteraction,
+} = require("./database");
 
-const app = express();
-app.use(express.json());
+function resolveNodeText(node, profile) {
+  if (!node.conditional) return node.text;
+  const profileKey = profile && node.textByProfile[profile] ? profile : "default";
+  return node.textByProfile[profileKey];
+}
 
-const PORT = process.env.PORT || 3000;
-const VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN || "msh_harmonie_verify";
+function processMessage(phoneNumber, messageText, buttonId) {
+  const session = getOrCreateSession(phoneNumber);
+  const sessionId = session.id;
 
-app.get("/", (req, res) => {
-  res.send("M-SANTE HARMONIE — serveur actif ✅");
-});
-
-app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("✅ Webhook vérifié avec succès par Meta");
-    return res.status(200).send(challenge);
+  if (messageText && !buttonId) {
+    const emergency = detectEmergency(messageText);
+    if (emergency.matched) {
+      const targetNode = NODES[emergency.targetNode];
+      updateSession(sessionId, { currentNode: emergency.targetNode });
+      logInteraction(sessionId, emergency.targetNode, true);
+      return { node: targetNode, nodeId: emergency.targetNode, sessionId: sessionId };
+    }
   }
 
-  console.warn("❌ Échec de vérification du webhook — token incorrect");
-  return res.sendStatus(403);
-});
+  const currentNodeId = session.current_node;
+  const currentNode = NODES[currentNodeId];
 
-app.post("/webhook", async (req, res) => {
-  res.sendStatus(200);
+  if (buttonId !== null && buttonId !== undefined && currentNode.buttons) {
+    const buttonIndex = parseInt(buttonId, 10);
+    const chosenButton = currentNode.buttons[buttonIndex];
 
-  try {
-    const entry = req.body.entry?.[0];
-    const change = entry?.changes?.[0];
-    const value = change?.value;
-    const message = value?.messages?.[0];
+    if (chosenButton) {
+      const newProfile = chosenButton.saveProfile || session.profile;
+      const nextNodeId = chosenButton.next;
+      const nextNode = NODES[nextNodeId];
 
-    if (!message) {
-      return;
+      updateSession(sessionId, { currentNode: nextNodeId, profile: newProfile });
+      logInteraction(sessionId, nextNodeId, !!nextNode.isUrgence);
+
+      return { node: nextNode, nodeId: nextNodeId, sessionId: sessionId, profile: newProfile };
     }
-
-    const from = message.from;
-    await markAsRead(message.id).catch(() => {});
-
-    let messageText = "";
-    let buttonId = null;
-
-    if (message.type === "text") {
-      messageText = message.text.body;
-    } else if (message.type === "interactive") {
-      const interactive = message.interactive;
-      if (interactive.type === "button_reply") {
-        buttonId = interactive.button_reply.id;
-      } else if (interactive.type === "list_reply") {
-        buttonId = interactive.list_reply.id;
-      }
-    } else {
-      await sendTextMessage(
-        from,
-        "Je peux seulement lire du texte pour le moment. Peux-tu reformuler ta question par écrit ? 💙"
-      );
-      return;
-    }
-
-    const { node, profile } = processMessage(from, messageText, buttonId);
-    const outgoing = buildOutgoingMessage(node, profile);
-
-    if (outgoing.buttons && outgoing.buttons.length > 0) {
-      await sendButtonsMessage(from, outgoing.text, outgoing.buttons);
-    } else {
-      await sendTextMessage(from, outgoing.text);
-    }
-  } catch (error) {
-    console.error("Erreur lors du traitement du message :", error?.response?.data || error.message);
   }
-});
 
-app.listen(PORT, () => {
-  console.log(`🌿 M-SANTÉ HARMONIE — serveur démarré sur le port ${PORT}`);
-  console.log(`   Webhook à configurer dans Meta : https://VOTRE-DOMAINE/webhook`);
-});
+  if (currentNode.freeText && messageText) {
+    const nextNodeId = currentNode.nextAfterFreeText;
+    const nextNode = NODES[nextNodeId];
+
+    updateSession(sessionId, { currentNode: nextNodeId });
+    logInteraction(sessionId, nextNodeId, !!nextNode.isUrgence);
+
+    return { node: nextNode, nodeId: nextNodeId, sessionId: sessionId, profile: session.profile };
+  }
+
+  logInteraction(sessionId, currentNodeId, !!currentNode.isUrgence);
+  return { node: currentNode, nodeId: currentNodeId, sessionId: sessionId, profile: session.profile };
+}
+
+function buildOutgoingMessage(node, profile) {
+  const text = resolveNodeText(node, profile);
+  const buttons = node.buttons || null;
+  return { text: text, buttons: buttons };
+}
+
+module.exports = {
+  processMessage: processMessage,
+  buildOutgoingMessage: buildOutgoingMessage,
+  resolveNodeText: resolveNodeText,
+};
